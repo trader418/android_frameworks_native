@@ -96,7 +96,7 @@ enum {
 };
 
 void acquire_object(const sp<ProcessState>& proc,
-    const flat_binder_object& obj, const void* who)
+    const flat_binder_object& obj, const void* who, size_t* outAshmemSize)
 {
     switch (obj.type) {
         case BINDER_TYPE_BINDER:
@@ -123,8 +123,15 @@ void acquire_object(const sp<ProcessState>& proc,
             return;
         }
         case BINDER_TYPE_FD: {
-            // intentionally blank -- nothing to do to acquire this, but we do
-            // recognize it as a legitimate object type.
+            if (obj.cookie != 0) {
+                if (outAshmemSize != NULL) {
+                    // If we own an ashmem fd, keep track of how much memory it refers to.
+                    int size = ashmem_get_size_region(obj.handle);
+                    if (size > 0) {
+                        *outAshmemSize += size;
+                    }
+                }
+            }
             return;
         }
     }
@@ -132,8 +139,14 @@ void acquire_object(const sp<ProcessState>& proc,
     ALOGD("Invalid object type 0x%08x", obj.type);
 }
 
-void release_object(const sp<ProcessState>& proc,
+void acquire_object(const sp<ProcessState>& proc,
     const flat_binder_object& obj, const void* who)
+{
+    acquire_object(proc, obj, who, NULL);
+}
+
+static void release_object(const sp<ProcessState>& proc,
+    const flat_binder_object& obj, const void* who, size_t* outAshmemSize)
 {
     switch (obj.type) {
         case BINDER_TYPE_BINDER:
@@ -160,12 +173,31 @@ void release_object(const sp<ProcessState>& proc,
             return;
         }
         case BINDER_TYPE_FD: {
-            if (obj.cookie != 0) close(obj.handle);
+            if (outAshmemSize != NULL) {
+                if (obj.cookie != 0) {
+                    int size = ashmem_get_size_region(obj.handle);
+                    if (size > 0) {
+                        *outAshmemSize -= size;
+                    }
+
+                    close(obj.handle);
+                }
+#ifdef DISABLE_ASHMEM_TRACKING
+            } else if (obj.cookie != 0) {
+                close(obj.handle);
+#endif
+            }
             return;
         }
     }
 
     ALOGE("Invalid object type 0x%08x", obj.type);
+}
+
+void release_object(const sp<ProcessState>& proc,
+    const flat_binder_object& obj, const void* who)
+{
+    release_object(proc, obj, who, NULL);
 }
 
 inline static status_t finish_flatten_binder(
@@ -504,7 +536,11 @@ status_t Parcel::appendFrom(const Parcel *parcel, size_t offset, size_t len)
 
             flat_binder_object* flat
                 = reinterpret_cast<flat_binder_object*>(mData + off);
+#ifndef DISABLE_ASHMEM_TRACKING
+            acquire_object(proc, *flat, this, &mOpenAshmemSize);
+#else
             acquire_object(proc, *flat, this);
+#endif
 
             if (flat->type == BINDER_TYPE_FD) {
                 // If this is a file descriptor, we need to dup it so the
@@ -922,9 +958,7 @@ status_t Parcel::writeBlob(size_t len, bool mutableCopy, WritableBlob* outBlob)
     ALOGV("writeBlob: write to ashmem");
     int fd = ashmem_create_region("Parcel Blob", len);
     if (fd < 0) return NO_MEMORY;
-#ifndef DISABLE_ASHMEM_TRACKING
-    mBlobAshmemSize += len;
-#endif
+
     int result = ashmem_set_prot_region(fd, PROT_READ | PROT_WRITE);
     if (result < 0) {
         status = result;
@@ -1026,7 +1060,11 @@ restart_write:
         // Need to write meta-data?
         if (nullMetaData || val.binder != 0) {
             mObjects[mObjectsSize] = mDataPos;
+#ifndef DISABLE_ASHMEM_TRACKING
+            acquire_object(ProcessState::self(), val, this, &mOpenAshmemSize);
+#else
             acquire_object(ProcessState::self(), val, this);
+#endif
             mObjectsSize++;
         }
 
@@ -1609,7 +1647,11 @@ void Parcel::releaseObjects()
         i--;
         const flat_binder_object* flat
             = reinterpret_cast<flat_binder_object*>(data+objects[i]);
+#ifndef DISABLE_ASHMEM_TRACKING
+        release_object(proc, *flat, this, &mOpenAshmemSize);
+#else
         release_object(proc, *flat, this);
+#endif
     }
 }
 
@@ -1623,7 +1665,11 @@ void Parcel::acquireObjects()
         i--;
         const flat_binder_object* flat
             = reinterpret_cast<flat_binder_object*>(data+objects[i]);
+#ifndef DISABLE_ASHMEM_TRACKING
+        acquire_object(proc, *flat, this, &mOpenAshmemSize);
+#else
         acquire_object(proc, *flat, this);
+#endif
     }
 }
 
@@ -1805,7 +1851,11 @@ status_t Parcel::continueWrite(size_t desired)
                     // will need to rescan because we may have lopped off the only FDs
                     mFdsKnown = false;
                 }
+#ifndef DISABLE_ASHMEM_TRACKING
+                release_object(proc, *flat, this, &mOpenAshmemSize);
+#else
                 release_object(proc, *flat, this);
+#endif
             }
             binder_size_t* objects =
                 (binder_size_t*)realloc(mObjects, objectsSize*sizeof(binder_size_t));
@@ -1891,7 +1941,7 @@ void Parcel::initState()
     mAllowFds = true;
     mOwner = NULL;
 #ifndef DISABLE_ASHMEM_TRACKING
-    mBlobAshmemSize = 0;
+    mOpenAshmemSize = 0;
 #endif
 }
 
@@ -1912,8 +1962,20 @@ void Parcel::scanForFds() const
 
 size_t Parcel::getBlobAshmemSize() const
 {
+    // This used to return the size of all blobs that were written to ashmem, now we're returning
+    // the ashmem currently referenced by this Parcel, which should be equivalent.
+    // TODO: Remove method once ABI can be changed.
 #ifndef DISABLE_ASHMEM_TRACKING
-    return mBlobAshmemSize;
+    return mOpenAshmemSize;
+#else
+    return 0;
+#endif
+}
+
+size_t Parcel::getOpenAshmemSize() const
+{
+#ifndef DISABLE_ASHMEM_TRACKING
+    return mOpenAshmemSize;
 #else
     return 0;
 #endif
